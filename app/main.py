@@ -390,7 +390,7 @@ def run_render(job_id: str, payload: dict[str, Any], request_base: str) -> None:
             f"[base][ov]overlay=0:0:shortest=1[outv]"
         )
         cmd = [
-        "ffmpeg", "-y", "-i", str(video_path), "-loop", "1", "-i", str(overlay_path),
+        "ffmpeg", "-y", "-t", "10", "-i", str(video_path), "-loop", "1", "-i", str(overlay_path),
         "-filter_complex", filter_complex,
         "-map", "[outv]", "-map", "0:a?",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
