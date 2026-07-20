@@ -390,14 +390,15 @@ def run_render(job_id: str, payload: dict[str, Any], request_base: str) -> None:
             f"[base][ov]overlay=0:0:shortest=1[outv]"
         )
         cmd = [
-            "ffmpeg", "-y", "-i", str(video_path), "-loop", "1", "-i", str(overlay_path),
-            "-filter_complex", filter_complex,
-            "-map", "[outv]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-            "-c:a", "aac", "-b:a", "128k", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart", "-shortest",
-            "-progress", "pipe:1", "-nostats", str(output_path),
-        ]
+        "ffmpeg", "-y", "-i", str(video_path), "-loop", "1", "-i", str(overlay_path),
+        "-filter_complex", filter_complex,
+        "-map", "[outv]", "-map", "0:a?",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        "-c:a", "aac", "-b:a", "128k", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", "-shortest",
+        "-fps_mode", "cfr",
+        "-progress", "pipe:1", "-nostats", str(output_path),
+    ]
         update_job(job_id, status="rendering", progress=20, stage="Renderizando com FFmpeg")
         run_ffmpeg_with_progress(job_id, cmd, duration, callback)
         if cancelled(job_id):
