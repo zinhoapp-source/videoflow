@@ -1,228 +1,257 @@
 import gc
 import os
-import re
+import shutil
 import subprocess
+import time
+from pathlib import Path
 
 import httpx
 
-from config import OUTPUT_DIR, TEMP_DIR
-from jobs import JobStatus
-from media_utils import ffprobe, generate_thumbnail, get_duration
+from app.config import OUTPUT_DIR, TEMP_DIR, THUMB_DIR
+from app.jobs import Job, JobStatus
+from app.media_utils import (
+    build_file_url,
+    ffprobe,
+    generate_thumbnail,
+    validate_png_file,
+    validate_video_file,
+)
 
-TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+def _download_to_file(url: str, destination: Path, timeout: int = 300) -> None:
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        with client.stream("GET", url) as response:
+            response.raise_for_status()
+            with destination.open("wb") as file:
+                for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                    file.write(chunk)
 
 
-def _extract_ffmpeg_errors(output_lines):
-    """Return only actual FFmpeg error lines, ignoring all banners and info."""
-    error_kws = (
-        "error", "Error", "ERROR", "failed", "Failed", "FAILED",
-        "Invalid", "invalid", "No such", "Cannot", "cannot",
-        "not found", "Unable", "unable", "missing", "Missing",
-        "Unsupported", "unsupported", "Permission denied",
-        "out of memory", "OOM", "Cannot allocate",
-        "Broken pipe", "reset by peer", "timed out",
-        "syntax", "argument", "refers",
+def _validate_dimensions(value: object, default: int, minimum: int = 1) -> int:
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError):
+        resolved = default
+    return max(minimum, resolved)
+
+
+def run_render(job: Job) -> None:
+    params = job.params
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    THUMB_DIR.mkdir(parents=True, exist_ok=True)
+
+    job_temp = TEMP_DIR / job.id
+    shutil.rmtree(job_temp, ignore_errors=True)
+    job_temp.mkdir(parents=True, exist_ok=True)
+
+    video_url = params["videoUrl"]
+    output_path = OUTPUT_DIR / f"{job.id}.mp4"
+    input_path = job_temp / "input-video"
+    overlay_path = job_temp / "overlay.png"
+    thumb_path = THUMB_DIR / f"{job.id}.jpg"
+
+    job.diagnostics = {"videoUrl": video_url}
+    job.set_status(
+        JobStatus.VALIDANDO,
+        progress=5,
+        stage="Baixando e validando o vídeo",
     )
-    err_lines = []
-    started_processing = False
-    
-    for raw in output_lines:
-        s = raw.strip()
-        if not s:
-            continue
-            
-        # O FFmpeg só começa a processar após ler os inputs e mapear os streams.
-        # Ignoramos tudo o que vier antes para não capturar versões e banners.
-        if "Stream #0:" in s or "Output #" in s or "press 'q' to stop" in s.lower():
-            started_processing = True
-            
-        if not started_processing:
-            continue
-            
-        # Se já começou, procuramos apenas por linhas que contenham palavras-chave de erro real
-        if any(kw in s for kw in error_kws):
-            err_lines.append(s)
-            
-    return err_lines
 
+    try:
+        _download_to_file(video_url, input_path)
+    except Exception as exc:
+        shutil.rmtree(job_temp, ignore_errors=True)
+        raise RuntimeError(f"Falha ao baixar vídeo: {exc}") from exc
 
-def build_filter_complex(canvas, win, fit_mode, has_overlay):
-    W = max(2, (int(canvas["width"]) // 2) * 2)
-    H = max(2, (int(canvas["height"]) // 2) * 2)
-    wx = max(0, min(W, (int(win.get("x", 0)) // 2) * 2))
-    wy = max(0, min(H, (int(win.get("y", 0)) // 2) * 2))
-    ww = max(2, min(W, (int(win.get("width", W)) // 2) * 2))
-    wh = max(2, min(H, (int(win.get("height", H)) // 2) * 2))
-    if wx + ww >= W and wy + wh >= H:
-        wx, wy, ww, wh = 0, 0, W, H
-
-    if fit_mode in ("cover", "fill"):
-        scale = f"scale={ww}:{wh}:force_original_aspect_ratio=increase:force_divisible_by=2,crop={ww}:{wh}"
-    elif fit_mode == "stretch":
-        scale = f"scale={ww}:{wh}"
-    else:
-        scale = f"scale={ww}:{wh}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={ww}:{wh}:-1:-1:black"
-
-    full_canvas = (wx == 0 and wy == 0 and ww == W and wh == H)
-    if full_canvas:
-        if has_overlay:
-            return f"[0:v]{scale}[scaled];[scaled][1:v]overlay=0:0[outv]", "[outv]"
-        return f"[0:v]{scale}[outv]", "[outv]"
-
-    if has_overlay:
-        chain = f"[0:v]{scale}[scaled];[scaled]pad={W}:{H}:{wx}:{wy}:black[padded];[padded][1:v]overlay=0:0[outv]"
-        return chain, "[outv]"
-    chain = f"[0:v]{scale}[scaled];[scaled]pad={W}:{H}:{wx}:{wy}:black[outv]"
-    return chain, "[outv]"
-
-
-def run_render(job):
-    p = job.params
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs(TEMP_DIR, exist_ok=True)
-
-    video_url = p["videoUrl"]
-    output_path = os.path.join(OUTPUT_DIR, f"{job.id}.mp4")
-    input_path = os.path.join(TEMP_DIR, f"{job.id}_input.mp4")
-    thumb_path = os.path.join(OUTPUT_DIR, f"{job.id}.jpg")
-
-    job.set_status(JobStatus.VALIDANDO, progress=5, stage="Baixando vídeo de origem")
-    with httpx.Client(timeout=300, follow_redirects=True) as client:
-        r = client.get(video_url)
-        r.raise_for_status()
-        with open(input_path, "wb") as f:
-            f.write(r.content)
-
-    if os.path.getsize(input_path) == 0:
-        try:
-            os.remove(input_path)
-        except Exception:
-            pass
-        job.set_status(JobStatus.ERRO, error="Vídeo de origem vazio")
+    if job.cancelled:
+        job.set_status(JobStatus.CANCELADO)
+        shutil.rmtree(job_temp, ignore_errors=True)
         return
 
-    overlay_path = None
-    overlay_url = (p.get("template") or {}).get("overlayUrl")
-    if overlay_url:
-        overlay_path = os.path.join(TEMP_DIR, f"{job.id}_overlay.png")
+    video_validation = validate_video_file(input_path)
+    job.diagnostics["input"] = video_validation
+    if not video_validation.get("valid"):
+        shutil.rmtree(job_temp, ignore_errors=True)
+        raise RuntimeError(
+            f"Vídeo inválido: {video_validation.get('reason', 'erro desconhecido')}"
+        )
+
+    overlay_url = (params.get("template") or {}).get("overlayUrl", "").strip()
+    has_overlay = bool(overlay_url)
+    if has_overlay:
+        job.set_status(
+            JobStatus.VALIDANDO,
+            progress=12,
+            stage="Baixando e validando a moldura PNG",
+        )
         try:
-            with httpx.Client(timeout=60, follow_redirects=True) as client:
-                resp = client.get(overlay_url)
-                if resp.status_code == 200 and resp.content:
-                    with open(overlay_path, "wb") as f:
-                        f.write(resp.content)
-                else:
-                    overlay_path = None
-        except Exception:
-            overlay_path = None
+            _download_to_file(overlay_url, overlay_path, timeout=90)
+        except Exception as exc:
+            shutil.rmtree(job_temp, ignore_errors=True)
+            raise RuntimeError(f"Falha ao baixar overlay: {exc}") from exc
 
-    total_duration = get_duration(input_path)
-    canvas = {"width": p.get("outputWidth", 720), "height": p.get("outputHeight", 1280)}
-    win = p.get("videoWindow") or {
-        "x": 0, "y": 0, "width": canvas["width"], "height": canvas["height"],
-    }
-    fit_mode = p.get("fitMode", "cover")
-    remove_audio = bool((p.get("template") or {}).get("removeAudio"))
+        overlay_validation = validate_png_file(overlay_path)
+        job.diagnostics["overlay"] = overlay_validation
+        if not overlay_validation.get("valid"):
+            shutil.rmtree(job_temp, ignore_errors=True)
+            raise RuntimeError(
+                f"Overlay inválido: {overlay_validation.get('reason')}"
+            )
 
-    filter_complex, out_label = build_filter_complex(canvas, win, fit_mode, bool(overlay_path))
+    output_width = _validate_dimensions(params.get("outputWidth"), 720)
+    output_height = _validate_dimensions(params.get("outputHeight"), 1280)
+    window = params.get("videoWindow") or {}
+    window_width = _validate_dimensions(window.get("width"), output_width)
+    window_height = _validate_dimensions(window.get("height"), output_height)
+    x = max(0, int(window.get("x", 0) or 0))
+    y = max(0, int(window.get("y", 0) or 0))
 
-    max_duration = p.get("maxDuration")
-    trim_start = p.get("trimStart")
-    trim_end = p.get("trimEnd")
+    if x + window_width > output_width or y + window_height > output_height:
+        shutil.rmtree(job_temp, ignore_errors=True)
+        raise RuntimeError(
+            "A janela do vídeo ultrapassa o tamanho do canvas. "
+            "Revise x, y, width e height."
+        )
 
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-nostdin"]
-    if trim_start:
-        cmd += ["-ss", str(trim_start)]
-    cmd += ["-i", input_path]
-    if overlay_path:
-        cmd += ["-i", overlay_path]
-    cmd += ["-filter_complex", filter_complex, "-map", out_label]
-    if not remove_audio:
-        cmd += ["-map", "0:a?"]
-    if max_duration:
-        cmd += ["-t", str(max_duration)]
-    elif trim_end and trim_start:
-        cmd += ["-t", str(float(trim_end) - float(trim_start))]
-    elif trim_end:
-        cmd += ["-to", str(trim_end)]
-    cmd += [
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-preset", "veryfast", "-crf", "23",
-        "-threads", "1",
-        "-x264-params", "threads=1",
+    fit_mode = str(params.get("fitMode", "cover")).lower()
+    if fit_mode == "contain":
+        fit_filter = (
+            f"scale={window_width}:{window_height}:"
+            "force_original_aspect_ratio=decrease,"
+            f"pad={window_width}:{window_height}:"
+            "(ow-iw)/2:(oh-ih)/2:color=black"
+        )
+    else:
+        fit_filter = (
+            f"scale={window_width}:{window_height}:"
+            "force_original_aspect_ratio=increase,"
+            f"crop={window_width}:{window_height}"
+        )
+
+    background = str(params.get("backgroundColor", "black"))
+    filter_parts = [
+        f"color=c={background}:s={output_width}x{output_height}:r=30[bg]",
+        f"[0:v]{fit_filter},setsar=1[vid]",
+        f"[bg][vid]overlay={x}:{y}:shortest=1[base]",
     ]
-    if not remove_audio:
-        cmd += ["-c:a", "aac", "-b:a", "128k"]
-    cmd += ["-movflags", "+faststart", output_path]
 
-    job.set_status(JobStatus.RENDERIZANDO, progress=10)
+    command = ["ffmpeg", "-y", "-i", str(input_path)]
+    if has_overlay:
+        command += ["-loop", "1", "-i", str(overlay_path)]
+        filter_parts += [
+            f"[1:v]scale={output_width}:{output_height},format=rgba[ov]",
+            "[base][ov]overlay=0:0:shortest=1[outv]",
+        ]
+    else:
+        filter_parts.append("[base]null[outv]")
 
-    proc = subprocess.Popen(  # noqa: S603
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    filter_complex = ";".join(filter_parts)
+    command += [
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[outv]",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        str(params.get("crf", 22)),
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-shortest",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        str(output_path),
+    ]
+
+    duration = float(video_validation.get("duration") or 0)
+    job.set_status(JobStatus.RENDERIZANDO, progress=20)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
     )
-    last_progress = 10
-    ffmpeg_output = []
-    for line in proc.stdout:
-        ffmpeg_output.append(line)
-        m = TIME_RE.search(line)
-        if m and total_duration > 0:
-            current = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-            effective_duration = max_duration or total_duration
-            pct = min(99, int(current / effective_duration * 89) + 10)
-            if pct > last_progress:
-                last_progress = pct
-                job.progress = pct
 
-    proc.wait()
-    for _tmp in (input_path, overlay_path):
-        try:
-            if _tmp and os.path.isfile(_tmp):
-                os.remove(_tmp)
-        except Exception:
-            pass
-    overlay_path = None
-
-    if proc.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-        if proc.returncode < 0:
-            import signal
+    assert process.stdout is not None
+    while True:
+        if job.cancelled:
+            process.terminate()
             try:
-                sig_name = signal.Signals(-proc.returncode).name
-            except ValueError:
-                sig_name = f"Sinal {-proc.returncode}"
-            hint = ""
-            if proc.returncode == -9:
-                hint = " — provável falta de memória no servidor. Reduza a resolução de saída."
-            job.set_status(JobStatus.ERRO, error=f"FFmpeg foi encerrado ({sig_name}{hint})")
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            job.set_status(JobStatus.CANCELADO, stage="Renderização cancelada")
+            shutil.rmtree(job_temp, ignore_errors=True)
             return
 
-        err_lines = _extract_ffmpeg_errors(ffmpeg_output)
-        if err_lines:
-            full_output = "\n".join(err_lines[-5:])[:400]
+        line = process.stdout.readline()
+        if line:
+            key, _, value = line.strip().partition("=")
+            if key in {"out_time_ms", "out_time_us"} and duration > 0:
+                try:
+                    seconds = int(value) / 1_000_000
+                    progress = 20 + int(min(1, seconds / duration) * 73)
+                    job.set_status(
+                        JobStatus.RENDERIZANDO,
+                        progress=min(93, progress),
+                    )
+                except ValueError:
+                    pass
+        elif process.poll() is not None:
+            break
         else:
-            full_output = (
-                f"Processamento concluído com código {proc.returncode}, mas sem erros reais identificados. "
-                f"Verifique se o vídeo gerado foi corrompido."
-            )
-        job.set_status(JobStatus.ERRO, error=f"FFmpeg falhou (código {proc.returncode})\n{full_output}")
-        return
+            time.sleep(0.05)
 
-    job.set_status(JobStatus.THUMBNAIL, progress=96)
+    stderr = process.stderr.read() if process.stderr else ""
+    if process.returncode != 0:
+        shutil.rmtree(job_temp, ignore_errors=True)
+        raise RuntimeError(f"FFmpeg falhou: {stderr[-1200:]}")
+
+    output_validation = validate_video_file(output_path)
+    job.diagnostics["output"] = output_validation
+    if not output_validation.get("valid"):
+        shutil.rmtree(job_temp, ignore_errors=True)
+        raise RuntimeError(
+            f"Saída inválida: {output_validation.get('reason', 'erro desconhecido')}"
+        )
+
+    job.set_status(JobStatus.THUMBNAIL, progress=95)
     generate_thumbnail(output_path, thumb_path, 1.0)
-    meta = ffprobe(output_path)
+    metadata = ffprobe(output_path)
 
-    base = (p.get("workerBaseUrl") or "").rstrip("/")
+    base_url = params.get("workerBaseUrl", "")
     result = {
-        "fileUrl": f"{base}/files/{job.id}.mp4",
-        "filename": f"{job.id}.mp4",
-        "duration": meta.get("duration"),
-        "width": meta.get("width"),
-        "height": meta.get("height"),
-        "size": meta.get("size"),
+        "fileUrl": build_file_url(base_url, "outputs", output_path.name),
+        "filename": output_path.name,
         "mimeType": "video/mp4",
+        "duration": metadata.get("duration"),
+        "width": metadata.get("width"),
+        "height": metadata.get("height"),
+        "size": metadata.get("size"),
+        "hasAudio": metadata.get("has_audio"),
     }
-    if os.path.exists(thumb_path):
-        result["thumbnailUrl"] = f"{base}/files/{job.id}.jpg"
-    job.result["__filePath"] = output_path
-    job.result["__thumbPath"] = thumb_path
+    if thumb_path.exists():
+        result["thumbnailUrl"] = build_file_url(
+            base_url,
+            "thumbnails",
+            thumb_path.name,
+        )
+
+    job.result["__filePath"] = str(output_path)
+    job.result["__thumbPath"] = str(thumb_path)
     job.set_status(JobStatus.CONCLUIDO, progress=100, **result)
+    shutil.rmtree(job_temp, ignore_errors=True)
     gc.collect()
