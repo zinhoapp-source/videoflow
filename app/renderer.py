@@ -11,22 +11,9 @@ from media_utils import ffprobe, generate_thumbnail, get_duration
 
 TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 
-# Prefixes that indicate standard FFmpeg banner/info/metadata. Never treat as errors.
-_NOISE_PREFIXES = (
-    "ffmpeg version", "built with", "configuration:", "  lib", "libav", "libsw", "libpost",
-    "Input #", "Output #", "Stream mapping", "Stream #", "  Metadata:",
-    "  Duration:", "  major_brand", "  minor_version", "  compatible_brands",
-    "  handler_name", "  vendor_id", "  encoder ", "  Side data", "  cpb:",
-    "Press [q]", "At least ", "frame=", "size=", "q=2-31", "Truncating",
-    "Option ", "Aquitting", "  libavutil", "  libavcodec", "  libavformat",
-    "  libavdevice", "  libavfilter", "  libswscale", "  libswresample", "  libpostproc",
-)
-_CONFIG_BRACKETS = ("[libx264", "[libavcodec", "[libavformat", "[libavfilter",
-                    "[libswscale", "[libswresample", "[libavutil")
-
 
 def _extract_ffmpeg_errors(output_lines):
-    """Return only lines that look like actual FFmpeg errors, ignoring banners."""
+    """Return only actual FFmpeg error lines, ignoring all banners and info."""
     error_kws = (
         "error", "Error", "ERROR", "failed", "Failed", "FAILED",
         "Invalid", "invalid", "No such", "Cannot", "cannot",
@@ -37,18 +24,25 @@ def _extract_ffmpeg_errors(output_lines):
         "syntax", "argument", "refers",
     )
     err_lines = []
+    started_processing = False
+    
     for raw in output_lines:
         s = raw.strip()
         if not s:
             continue
-        # Ignore lines starting with version/banner info or numbers/libraries
-        if any(s.startswith(p) for p in _NOISE_PREFIXES) or s[0].isdigit():
+            
+        # O FFmpeg só começa a processar após ler os inputs e mapear os streams.
+        # Ignoramos tudo o que vier antes para não capturar versões e banners.
+        if "Stream #0:" in s or "Output #" in s or "press 'q' to stop" in s.lower():
+            started_processing = True
+            
+        if not started_processing:
             continue
-        if any(s.startswith(b) for b in _CONFIG_BRACKETS):
-            if not any(kw in s for kw in error_kws):
-                continue
+            
+        # Se já começou, procuramos apenas por linhas que contenham palavras-chave de erro real
         if any(kw in s for kw in error_kws):
             err_lines.append(s)
+            
     return err_lines
 
 
@@ -206,8 +200,8 @@ def run_render(job):
             full_output = "\n".join(err_lines[-5:])[:400]
         else:
             full_output = (
-                f"FFmpeg encerrou com código {proc.returncode} sem mensagem de erro "
-                f"identificável. Possível falta de memória — reduza a resolução."
+                f"Processamento concluído com código {proc.returncode}, mas sem erros reais identificados. "
+                f"Verifique se o vídeo gerado foi corrompido."
             )
         job.set_status(JobStatus.ERRO, error=f"FFmpeg falhou (código {proc.returncode})\n{full_output}")
         return
