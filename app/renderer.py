@@ -11,31 +11,22 @@ from media_utils import ffprobe, generate_thumbnail, get_duration
 
 TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 
-# Lines that are always noise — banner, library info, input/output config,
-# stream mapping, progress stats, metadata. These never contain the actual
-# error and must be excluded from the error message shown to the user.
+# Prefixes that indicate standard FFmpeg banner/info/metadata. Never treat as errors.
 _NOISE_PREFIXES = (
-    "ffmpeg version", "configuration:", "  lib", "libav", "libsw", "libpost",
+    "ffmpeg version", "built with", "configuration:", "  lib", "libav", "libsw", "libpost",
     "Input #", "Output #", "Stream mapping", "Stream #", "  Metadata:",
     "  Duration:", "  major_brand", "  minor_version", "  compatible_brands",
     "  handler_name", "  vendor_id", "  encoder ", "  Side data", "  cpb:",
     "Press [q]", "At least ", "frame=", "size=", "q=2-31", "Truncating",
-    "Option ", "Aquitting",
+    "Option ", "Aquitting", "  libavutil", "  libavcodec", "  libavformat",
+    "  libavdevice", "  libavfilter", "  libswscale", "  libswresample", "  libpostproc",
 )
-# Lines starting with these bracket-prefixed filters are libx264/libavcodec
-# config lines (e.g. "[libx264 @ 0x...] using SAR=1/1") — not errors.
 _CONFIG_BRACKETS = ("[libx264", "[libavcodec", "[libavformat", "[libavfilter",
                     "[libswscale", "[libswresample", "[libavutil")
 
 
 def _extract_ffmpeg_errors(output_lines):
-    """Return only lines that look like actual FFmpeg errors.
-
-    FFmpeg errors are lines that:
-    - Start with '[' (filter/codec context) but are NOT config lines
-    - Contain an error keyword (Error, failed, Invalid, No such, etc.)
-    Everything else (banner, input info, output config, progress) is noise.
-    """
+    """Return only lines that look like actual FFmpeg errors, ignoring banners."""
     error_kws = (
         "error", "Error", "ERROR", "failed", "Failed", "FAILED",
         "Invalid", "invalid", "No such", "Cannot", "cannot",
@@ -50,42 +41,24 @@ def _extract_ffmpeg_errors(output_lines):
         s = raw.strip()
         if not s:
             continue
-        # Skip noise lines (banner, input info, output config, progress).
-        if any(s.startswith(p) for p in _NOISE_PREFIXES):
+        # Ignore lines starting with version/banner info or numbers/libraries
+        if any(s.startswith(p) for p in _NOISE_PREFIXES) or s[0].isdigit():
             continue
-        # Skip libx264/libav config lines that start with [lib...
         if any(s.startswith(b) for b in _CONFIG_BRACKETS):
-            # But keep them if they contain an actual error keyword.
             if not any(kw in s for kw in error_kws):
                 continue
-        # An error line must contain an error keyword.
         if any(kw in s for kw in error_kws):
             err_lines.append(s)
     return err_lines
 
 
 def build_filter_complex(canvas, win, fit_mode, has_overlay):
-    """Build the FFmpeg filter_complex for the renderSpec.
-
-    Uses `pad` instead of `color=black` + `overlay` to place the video window
-    on the canvas. This is dramatically more memory-efficient: `color=black`
-    creates an INFINITE source of full-canvas frames (1080×1920 × 3 bytes ×
-    thread count), which causes OOM kills on Railway. `pad` simply adds black
-    borders to the existing scaled video frames — one buffer at a time.
-
-    1. Scale + crop/pad the source video into the video window (ww×wh).
-    2. Pad the scaled video to the full canvas (W×H) with black at (wx, wy).
-    3. Overlay the transparent PNG frame on top (always in front of the video).
-    """
-    # Ensure even dimensions — libx264 with yuv420p rejects odd width/height.
     W = max(2, (int(canvas["width"]) // 2) * 2)
     H = max(2, (int(canvas["height"]) // 2) * 2)
-    # Clamp the video window to fit within the canvas.
     wx = max(0, min(W, (int(win.get("x", 0)) // 2) * 2))
     wy = max(0, min(H, (int(win.get("y", 0)) // 2) * 2))
     ww = max(2, min(W, (int(win.get("width", W)) // 2) * 2))
     wh = max(2, min(H, (int(win.get("height", H)) // 2) * 2))
-    # If the window is at least as large as the canvas, treat it as full canvas.
     if wx + ww >= W and wy + wh >= H:
         wx, wy, ww, wh = 0, 0, W, H
 
@@ -93,19 +66,15 @@ def build_filter_complex(canvas, win, fit_mode, has_overlay):
         scale = f"scale={ww}:{wh}:force_original_aspect_ratio=increase:force_divisible_by=2,crop={ww}:{wh}"
     elif fit_mode == "stretch":
         scale = f"scale={ww}:{wh}"
-    else:  # contain / center
-        # force_divisible_by=2 ensures the scaled dimensions are even, so
-        # (ow-iw)/2 and (oh-ih)/2 are always integers (pad rejects non-integer x/y).
-        scale = f"scale={ww}:{wh}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={ww}:{wh}:(ow-iw)/2:(oh-ih)/2:black"
+    else:
+        scale = f"scale={ww}:{wh}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={ww}:{wh}:-1:-1:black"
 
-    # If the video window fills the entire canvas, no outer pad is needed.
     full_canvas = (wx == 0 and wy == 0 and ww == W and wh == H)
     if full_canvas:
         if has_overlay:
             return f"[0:v]{scale}[scaled];[scaled][1:v]overlay=0:0[outv]", "[outv]"
         return f"[0:v]{scale}[outv]", "[outv]"
 
-    # Pad the scaled video to the full canvas at (wx, wy) with black borders.
     if has_overlay:
         chain = f"[0:v]{scale}[scaled];[scaled]pad={W}:{H}:{wx}:{wy}:black[padded];[padded][1:v]overlay=0:0[outv]"
         return chain, "[outv]"
@@ -114,7 +83,6 @@ def build_filter_complex(canvas, win, fit_mode, has_overlay):
 
 
 def run_render(job):
-    """Download source video + overlay, run FFmpeg, probe the result."""
     p = job.params
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(TEMP_DIR, exist_ok=True)
@@ -125,7 +93,6 @@ def run_render(job):
     thumb_path = os.path.join(OUTPUT_DIR, f"{job.id}.jpg")
 
     job.set_status(JobStatus.VALIDANDO, progress=5, stage="Baixando vídeo de origem")
-    # Synchronous download of the input video (it is a Base44 storage URL).
     with httpx.Client(timeout=300, follow_redirects=True) as client:
         r = client.get(video_url)
         r.raise_for_status()
@@ -140,7 +107,6 @@ def run_render(job):
         job.set_status(JobStatus.ERRO, error="Vídeo de origem vazio")
         return
 
-    # Download the transparent overlay PNG if provided.
     overlay_path = None
     overlay_url = (p.get("template") or {}).get("overlayUrl")
     if overlay_url:
@@ -214,7 +180,6 @@ def run_render(job):
                 job.progress = pct
 
     proc.wait()
-    # --- Temp files no longer needed: clean up immediately to free RAM ---
     for _tmp in (input_path, overlay_path):
         try:
             if _tmp and os.path.isfile(_tmp):
@@ -222,8 +187,8 @@ def run_render(job):
         except Exception:
             pass
     overlay_path = None
+
     if proc.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-        # Detect signal kills (OOM, manual termination, etc.)
         if proc.returncode < 0:
             import signal
             try:
@@ -233,25 +198,13 @@ def run_render(job):
             hint = ""
             if proc.returncode == -9:
                 hint = " — provável falta de memória no servidor. Reduza a resolução de saída."
-            elif proc.returncode == -11:
-                hint = " — falha de segmentação no FFmpeg."
             job.set_status(JobStatus.ERRO, error=f"FFmpeg foi encerrado ({sig_name}{hint})")
             return
 
-        # Extract only actual error lines from the FFmpeg output.
-        # FFmpeg errors typically appear as:
-        #   [AVFilterGraph @ 0x...] Error parsing filterchain ...
-        #   [Parsed_pad_0 @ 0x...] Failed to configure input pad ...
-        #   [libx264 @ 0x...] broken on default
-        # They always start with '[' and contain an error keyword.
-        # Everything else (banner, library versions, input/stream info,
-        # output config, progress lines) is noise and must be excluded.
         err_lines = _extract_ffmpeg_errors(ffmpeg_output)
         if err_lines:
             full_output = "\n".join(err_lines[-5:])[:400]
         else:
-            # No recognizable error line → FFmpeg was likely killed silently
-            # (OOM, container limit) or the error format is unexpected.
             full_output = (
                 f"FFmpeg encerrou com código {proc.returncode} sem mensagem de erro "
                 f"identificável. Possível falta de memória — reduza a resolução."
@@ -278,4 +231,4 @@ def run_render(job):
     job.result["__filePath"] = output_path
     job.result["__thumbPath"] = thumb_path
     job.set_status(JobStatus.CONCLUIDO, progress=100, **result)
-    gc.collect()  # release decoder buffers before the next job starts
+    gc.collect()
